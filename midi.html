@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>MIDI Quiz Game - Host</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    #status {
+      margin-bottom: 15px;
+      font-weight: bold;
+    }
+    .player {
+      margin: 5px 0;
+    }
+    button {
+      margin: 5px;
+      padding: 5px 10px;
+    }
+    #controls {
+      margin-bottom: 15px;
+    }
+    #timer {
+      font-size: 20px;
+      font-weight: bold;
+      color: red;
+    }
+    #nominal {
+      font-size: 18px;
+      margin: 10px 0;
+    }
+    /* Scrollable log area with fixed height */
+    #messages {
+      max-height: 150px;
+      overflow-y: auto;
+      border: 1px solid #ccc;
+      padding: 5px;
+      list-style: none;
+      margin: 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>MIDI Quiz Game - Host</h1>
+  <div id="status">Initializing...</div>
+  
+  <div id="controls">
+    <!-- Host Buttons -->
+    <button id="time">Time</button>
+    <button id="correct">Correct</button>
+    <button id="wrong">Wrong</button>
+    <button id="cancel">Cancel</button>
+    <button id="next">Next</button>
+    <button id="resetGame">Reset Game</button>
+  </div>
+  
+  <div id="nominal">Nominal: <span id="nominal-value">10</span></div>
+  <div id="timer">Timer: <span id="timer-value">0</span></div>
+  
+  <h2>Players</h2>
+  <div id="players"></div>
+  
+  <ul id="messages"></ul>
+  
+  <script>
+    // Global variables and game state
+    let midiAccess = null;
+    let players = [];  // Fixed 8 players.
+    let activePlayer = null; // The player whose button press is active.
+    
+    // Player tones: player 1 uses pitch 24, …, player 8 uses pitch 31.
+    const playerTones = [24, 25, 26, 27, 28, 29, 30, 31];
+    
+    // Nominal values (cycle): 10, 20, 30, 40, 50 then back to 10.
+    const nominals = [10, 20, 30, 40, 50];
+    let currentNominalIndex = 0;
+    
+    // Timer variables
+    let timerIntervalID = null;
+    let timerRunning = false;
+    let timeLeft = 0;
+    
+    // Flag to ignore button presses for 2 seconds after timer expiry
+    let ignoreButtons = false;
+    
+    // Save game state (players and current nominal index) to local storage
+    function saveGameState() {
+      const state = {
+        players: players,
+        currentNominalIndex: currentNominalIndex
+      };
+      localStorage.setItem("midiGameState", JSON.stringify(state));
+    }
+    
+    // Load game state from local storage if available
+    function loadGameState() {
+      const stored = localStorage.getItem("midiGameState");
+      if (stored) {
+        try {
+          const state = JSON.parse(stored);
+          if (state.players && typeof state.currentNominalIndex === "number") {
+            players = state.players.map(p => ({
+              id: p.id,
+              tone: p.tone,
+              score: p.score,
+              pressed: false,          // Reset pressed state on load
+              ignored: false,          // Reset ignored state on load
+              answeredDuringTimer: false
+            }));
+            currentNominalIndex = state.currentNominalIndex;
+          }
+        } catch (e) {
+          console.error("Failed to parse game state:", e);
+        }
+      }
+    }
+    
+    // Initialize game: create players and add event listeners.
+    function initGame() {
+      document.getElementById('status').innerText = "Waiting for players and MIDI access...";
+      
+      // Setup host button listeners.
+      document.getElementById('time').addEventListener('click', hostStartTimer);
+      document.getElementById('correct').addEventListener('click', hostCorrect);
+      document.getElementById('wrong').addEventListener('click', hostWrong);
+      document.getElementById('cancel').addEventListener('click', hostCancel);
+      document.getElementById('next').addEventListener('click', hostNext);
+      document.getElementById('resetGame').addEventListener('click', resetGame);
+      
+      // Load saved game state or create new players.
+      loadGameState();
+      if (!players.length) {
+        players = playerTones.map((tone, index) => ({
+          id: index + 1,
+          tone: tone,
+          score: 0,
+          pressed: false,
+          ignored: false,
+          answeredDuringTimer: false
+        }));
+      }
+      
+      updatePlayersUI();
+      updateNominalUI();
+      updateTimerUI(0);
+      updateHostControls();
+      saveGameState();
+    }
+    
+    // MIDI Setup: Request access then set up inputs.
+    if (navigator.requestMIDIAccess) {
+      navigator.requestMIDIAccess()
+        .then(onMIDISuccess, onMIDIFailure);
+    } else {
+      document.getElementById('status').innerText = "Web MIDI API is not supported in this browser.";
+    }
+    
+    function onMIDISuccess(midi) {
+      midiAccess = midi;
+      document.getElementById('status').innerText = "MIDI Access Ready! Waiting for player button presses.";
+      for (let input of midiAccess.inputs.values()) {
+        input.onmidimessage = handleMIDIMessage;
+      }
+    }
+    
+    function onMIDIFailure() {
+      document.getElementById('status').innerText = "Could not access MIDI devices.";
+    }
+    
+    // Handle incoming MIDI messages (player button presses).
+    function handleMIDIMessage(message) {
+      const [command, note, velocity] = message.data;
+      if (command === 144 && velocity > 0) {
+        if (ignoreButtons || activePlayer) return;
+        const player = players.find(p => p.tone === note);
+        if (player && !player.ignored) {
+          activePlayer = player;
+          player.pressed = true;
+          if (timerRunning) {
+            player.answeredDuringTimer = true;
+            stopTimer();
+          } else {
+            player.answeredDuringTimer = false;
+          }
+          playBeepSound();
+          sendMIDIMessage(player.tone);
+          logMessage(`Player ${player.id} pressed their button.`);
+          updatePlayersUI();
+          updateHostControls(); // Enables Correct, Wrong, and Cancel; disables Time.
+          saveGameState();
+        }
+      }
+    }
+    
+    // Host Button Handlers
+    
+    // "Time" button: Start a 7-second countdown if no player's button is pressed.
+    function hostStartTimer() {
+      if (players.some(p => p.pressed)) {
+        logMessage("Cannot start timer: a player's button is already pressed.");
+        return;
+      }
+      if (timerRunning) {
+        logMessage("Timer is already running.");
+        return;
+      }
+      startTimer();
+    }
+    
+    // "Correct" button: Award the active player with +nominal points, advance nominal, and reset the round.
+    function hostCorrect() {
+      if (!activePlayer) {
+        logMessage("No player's button is active to mark as correct.");
+        return;
+      }
+      activePlayer.score += nominals[currentNominalIndex];
+      logMessage(`Player ${activePlayer.id} answered correctly! +${nominals[currentNominalIndex]} points.`);
+      advanceNominal();
+      resetRound();
+      saveGameState();
+    }
+    
+    // "Wrong" button: Deduct the active player's score and mark their button as ignored.
+    // Restart the timer only if the player answered while the timer was running.
+    function hostWrong() {
+      if (!activePlayer) {
+        logMessage("No player's button is active to mark as wrong.");
+        return;
+      }
+      activePlayer.score -= nominals[currentNominalIndex];
+      activePlayer.ignored = true;
+      logMessage(`Player ${activePlayer.id} answered incorrectly! -${nominals[currentNominalIndex]} points.`);
+      const answeredDuringTimer = activePlayer.answeredDuringTimer;
+      resetActiveState();
+      if (answeredDuringTimer) {
+        startTimer();
+      }
+      saveGameState();
+    }
+    
+    // "Cancel" button: Reset timer and clear all players' pressed and ignored flags.
+    // Enabled only when a player's button is pressed.
+    function hostCancel() {
+      logMessage("Host canceled the current round. Resetting button states and timer.");
+      stopTimer();
+      resetRound();
+      saveGameState();
+    }
+    
+    // "Next" button: Advance nominal without changing scores and reset the round.
+    function hostNext() {
+      logMessage("Host pressed Next.");
+      advanceNominal();
+      resetRound();
+      if (timerRunning) stopTimer();
+      saveGameState();
+    }
+    
+    // "Reset Game" button: Set all player scores to 0, set nominal back to 10, and reset timer.
+    function resetGame() {
+      stopTimer();
+      players.forEach(p => p.score = 0);
+      currentNominalIndex = 0; // This makes the displayed nominal 10.
+      resetRound();
+      logMessage("Reset Game: All player scores set to 0 and nominal set to 10.");
+      updatePlayersUI();
+      updateNominalUI();
+      saveGameState();
+    }
+    
+    // Timer functions
+    function startTimer() {
+      timerRunning = true;
+      timeLeft = 7;
+      updateTimerUI(timeLeft);
+      logMessage("Timer started: 7 seconds left.");
+      timerIntervalID = setInterval(() => {
+        timeLeft--;
+        updateTimerUI(timeLeft);
+        if (timeLeft <= 0) {
+          stopTimer();
+          onTimerExpired();
+        }
+      }, 1000);
+    }
+    
+    function stopTimer() {
+      if (timerIntervalID) {
+        clearInterval(timerIntervalID);
+        timerIntervalID = null;
+      }
+      timerRunning = false;
+      updateTimerUI(0);
+    }
+    
+    // When the timer expires, lock button presses for 2 seconds and advance nominal.
+    function onTimerExpired() {
+      logMessage("Timer expired: no button pressed. Buttons are locked for 2 seconds.");
+      ignoreButtons = true;
+      setTimeout(() => {
+        ignoreButtons = false;
+        logMessage("Buttons are active again.");
+        advanceNominal();
+        saveGameState();
+      }, 2000);
+    }
+    
+    // Advance the nominal value (cycle through 10, 20, 30, 40, 50).
+    function advanceNominal() {
+      currentNominalIndex = (currentNominalIndex + 1) % nominals.length;
+      updateNominalUI();
+      logMessage(`Nominal advanced to ${nominals[currentNominalIndex]}.`);
+    }
+    
+    // Reset only the active player's pressed state.
+    function resetActiveState() {
+      if (activePlayer) {
+        sendMIDIMessage(activePlayer.tone, true); // Send MIDI Note Off.
+        activePlayer.pressed = false;
+      }
+      activePlayer = null;
+      updatePlayersUI();
+      updateHostControls();
+    }
+    
+    // Reset the round: clear all players’ pressed and ignored flags.
+    function resetRound() {
+      stopTimer();
+      players.forEach(p => {
+        p.pressed = false;
+        p.ignored = false;
+        p.answeredDuringTimer = false;
+      });
+      resetActiveState()
+      activePlayer = null;
+      updatePlayersUI();
+      updateHostControls();
+    }
+    
+    // Send a MIDI message to all outputs.
+    function sendMIDIMessage(note, stop = false) {
+      if (!midiAccess) return;
+      for (let output of midiAccess.outputs.values()) {
+        if (stop) {
+          output.send([0x81, note, 0]); // Note Off.
+        } else {
+          output.send([0x91, note, 127]); // Note On.
+        }
+      }
+    }
+    
+    // Play a beep sound using the Web Audio API (200ms duration).
+    function playBeepSound() {
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioCtx.createOscillator();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(440, audioCtx.currentTime);
+      oscillator.connect(audioCtx.destination);
+      oscillator.start();
+      setTimeout(() => oscillator.stop(), 200);
+    }
+    
+    // UI update functions
+    function updatePlayersUI() {
+      const playersDiv = document.getElementById('players');
+      playersDiv.innerHTML = '';
+      players.forEach(player => {
+        const div = document.createElement('div');
+        div.className = 'player';
+        let status = player.pressed ? 'Pressed' : 'Not Pressed';
+        if (player.ignored) status += " (Ignored)";
+        div.innerText = `Player ${player.id} (Pitch: ${player.tone}) - Score: ${player.score} - ${status}`;
+        playersDiv.appendChild(div);
+      });
+    }
+    
+    function updateNominalUI() {
+      document.getElementById('nominal-value').innerText = nominals[currentNominalIndex];
+    }
+    
+    function updateTimerUI(val) {
+      document.getElementById('timer-value').innerText = val;
+    }
+    
+    // Update host controls:
+    // Enable "Correct", "Wrong" and "Cancel" only when a player's button is active;
+    // disable "Time" when a player's button is pressed.
+    function updateHostControls() {
+      const correctBtn = document.getElementById('correct');
+      const wrongBtn   = document.getElementById('wrong');
+      const cancelBtn  = document.getElementById('cancel');
+      const timeBtn    = document.getElementById('time');
+      if (activePlayer) {
+        correctBtn.disabled = false;
+        wrongBtn.disabled = false;
+        cancelBtn.disabled = false;
+        timeBtn.disabled = true;
+      } else {
+        correctBtn.disabled = true;
+        wrongBtn.disabled = true;
+        cancelBtn.disabled = true;
+        timeBtn.disabled = false;
+      }
+    }
+    
+    // Add a log message at the top of the log element.
+    function logMessage(msg) {
+      const li = document.createElement('li');
+      li.innerText = msg;
+      const messagesContainer = document.getElementById('messages');
+      messagesContainer.insertBefore(li, messagesContainer.firstChild);
+    }
+    
+    // Start the game.
+    initGame();
+  </script>
+</body>
+</html>
